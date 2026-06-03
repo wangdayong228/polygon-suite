@@ -14,3 +14,6 @@
 [submodule "zkevm-prover"]
 	path = zkevm-prover
 	url = https://github.com/0xPolygon/zkevm-prover.git
+[submodule "ydyl-scripts-lib"]
+	path = ydyl-scripts-lib
+	url = https://github.com/wangdayong228/ydyl-scripts-lib.git
