@@ -1,0 +1,229 @@
+---
+description: polygon-suite 单体仓库架构、子模块职责与 CDK 部署开发约定
+alwaysApply: true
+---
+
+# polygon-suite 架构与开发约定
+
+## 1. 概述
+
+**polygon-suite** 是 Polygon CDK zkEVM Rollup 的**集成工作区**（meta-repo），不是单一可执行应用。目标是在**外部 L1**（主要为 Conflux eSpace）上部署、调试并运维一条 CDK L2；日常编排入口在 `cdk-work/`。
+
+### 子模块清单
+
+| 路径 | 上游 / 分支 | 职责 |
+|------|-------------|------|
+| `cdk/` | `Pana/cdk` @ `conflux0.5.4` | L2 **cdk-node**（Aggregator、序列提交、L1 结算编排）；Go 主二进制 + Rust workspace（`crates/cdk` CLI） |
+| `agglayer-contracts/` | `agglayer/agglayer-contracts` | L1/L2 **Solidity 合约**（`PolygonRollupManager`、`PolygonZkEVMBridge`、`GlobalExitRoot` 等，见 `contracts/v2/`） |
+| `kurtosis-cdk/` | `Pana/kurtosis-cdk` | **Kurtosis 包**：合约部署、容器编排、服务模板与默认 `params.yml` |
+| `cdk-work/` | `wangdayong228/cdk-work` | **项目专属**：部署脚本、`params.template.yml`、nginx 暴露、运维文档 |
+| `zkevm-prover/` | `0xPolygon/zkevm-prover` | **C++ 证明器**：Executor / Aggregator Client / StateDB（gRPC） |
+
+### 非 submodule 依赖
+
+`cdk-work/scripts/deploy.sh` 依赖仓库根目录下的 `ydyl-scripts-lib/`（**未**列入 `.gitmodules`；环境变量 `YDYL_SCRIPTS_LIB_DIR`，默认 `<polygon-suite>/ydyl-scripts-lib`）。未准备该目录时部署脚本会失败。
+
+### 首次克隆
+
+```sh
+git submodule update --init --recursive
+```
+
+```mermaid
+flowchart TB
+    subgraph suite [polygon-suite]
+        cdkWork[cdk-work]
+        kurtosis[kurtosis-cdk]
+        cdkMod[cdk]
+        contracts[agglayer-contracts]
+        prover[zkevm-prover]
+    end
+    subgraph runtime [Kurtosis Enclave]
+        seq[cdk-erigon-sequencer]
+        rpcNode[cdk-erigon-rpc]
+        node[cdk-node]
+        zkp[zkevm-prover]
+        bridge[zkevm-bridge-service]
+        pg[(postgres)]
+    end
+    L1[外部 L1 如 Conflux eSpace]
+    cdkWork -->|params + deploy.sh| kurtosis
+    kurtosis --> runtime
+    contracts -->|部署到| L1
+    cdkMod -->|cdk_node_image| node
+    prover -->|zkevm_prover_image| zkp
+    seq --> L1
+    node --> rpcNode
+    node --> L1
+    zkp --> node
+```
+
+---
+
+## 2. 运行时架构
+
+### 当前默认部署形态
+
+与 `cdk-work/scripts/params.template.yml` 一致：
+
+| 参数 | 值 | 含义 |
+|------|-----|------|
+| `deploy_l1` | `false` | 使用已有 L1 RPC，不启动本地 L1 |
+| `deploy_agglayer` | `false` | **L1 直连结算**，不走 Agglayer |
+| `sequencer_type` | `erigon` | Erigon 系 sequencer |
+| `erigon_strict_mode` | `false` | Sequencer 内部执行，不连外部 stateless executor |
+| `zkevm_use_mock_prover_client` | `true` | prover 容器内走 `runAggregatorClientMock`（与 `zkevm_use_real_prover_client` 互斥） |
+| `zkevm_use_real_prover_client` | `false` | 改为 `true` 启用真实证明生成（需大内存/GPU） |
+| `zkevm_use_real_verifier` | `true` | L1 部署 **真实** Verifier 合约（`realVerifier`）；见下方 prover 容器说明 |
+
+**prover 容器是否启动**（`kurtosis-cdk/cdk_central_environment.star`）：仅当 `zkevm_use_real_verifier == false` **或** `zkevm_use_real_prover_client == true` 时启动 `zkevm-prover` 服务。当前模板为 `true` + `false` → **不部署 prover 容器**；与 `cdk-work/doc/architecture-cdk-rollup.md` 图中常驻 `zkevm-prover-1` 的表述可能不一致，以实际 enclave 为准。
+
+### L1 合约层
+
+部署在 L1 上的核心合约（`agglayer-contracts/contracts/v2/`，Etrog/fork 12 路径）：
+
+- `PolygonRollupManager` — Rollup 注册与批次验证入口
+- `PolygonZkEVMEtrog`（或 `PolygonZkEVMExistentEtrog`）— Rollup 共识合约
+- `PolygonZkEVMGlobalExitRootV2` — 全局退出根
+- `PolygonZkEVMBridgeV2` — L1 桥
+- Verifier — `zkevm_use_real_verifier: true` 时部署链上真实验证器；`false` 时为 mock
+
+### L2 核心服务（Kurtosis Enclave）
+
+| 服务 | 职责 | 关键连接 |
+|------|------|----------|
+| `cdk-erigon-sequencer` | 交易排序、出块、封 batch | 读 L1；datastream → rpc；postgres `erigon_state` |
+| `cdk-erigon-rpc` | 只读 RPC；提供 witness（`zkevm_getWitness`） | pool-manager 转发 `eth_sendRawTransaction`；postgres |
+| `cdk-node` | Aggregator（:50081）；向 L1 `sequenceBatches` / `verifyBatches` | WitnessURL → rpc；SettlementBackend → L1 |
+| `zkevm-prover` | 证明生成（aggregatorClient） | **prover → cdk-node** gRPC；postgres `prover_db`；**当前 params 下可能不部署** |
+| `zkevm-pool-manager` | 交易池协调 | 与 sequencer / rpc 配合 |
+| `zkevm-bridge-service` | 跨链中继 | 监听 L1 桥 + L2 rpc 事件 |
+| `postgres` | 共享库 | aggregator_db、bridge_db、prover_db、erigon_state |
+
+### Batch 状态
+
+链上/RPC 可见的批次进度：**Trusted → Virtual → Verified**。语义与排查见 `cdk-work/doc/Trusted Batch 和 Virtual Batch Number 的关系和区别.md`。
+
+### 证明管线（概要）
+
+```
+BatchProof (Stark) → AggregatedProof (Circom) → FinalProof (Groth16) → L1 verify
+```
+
+cdk-node 编排何时为哪个 batch 向 prover 请求证明；prover 作为客户端连 Aggregator。详细端口矩阵、序列图、配置溯源表见 **`cdk-work/doc/architecture-cdk-rollup.md`**（勿在本规则中重复全文）。
+
+---
+
+## 3. 子模块开发指南
+
+### cdk
+
+- 主二进制：**cdk-node**（Go，`cdk/cmd/main.go`）
+- 构建：`cd cdk && make build`；部署用镜像：`make build-docker`，params 中设置 `cdk_node_image`
+- Rust：`crates/cdk` workspace，`cargo run` 用于 CLI/配置工具
+- 关键 Go 包：`aggregator/`、`sequencesender/`、`etherman/`、`aggsender/` 等
+
+### agglayer-contracts
+
+- 主合约目录：`contracts/v2/`（如 `PolygonRollupManager.sol`、`PolygonZkEVMBridgeV2.sol`）
+- 工具链：README 要求 Node 16.x、npm 7.x（`package.json` 未声明 `engines`，以子模块 README 为准）
+- 测试与检查：`npm run test`、`npm run lint`
+- 镜像版本由 params 中 `agglayer_contracts_image` 指定；改合约后须同步构建/发布镜像
+
+### kurtosis-cdk
+
+- 部署入口：`kurtosis run --enclave <name> --args-file <params.yml> .`（在 `kurtosis-cdk/` 目录）
+- `deployment_stages.*` 控制部署阶段；`args.*` 覆盖组件镜像与行为
+- `cdk-work` 通过 `DEPLOY_PACKAGE_LOCATOR` 固定 kurtosis-cdk 的 git commit（见 `deploy.sh`）
+- **非生产**：包 README 明确仅用于 devnet/测试
+
+### cdk-work
+
+- **主部署**：`scripts/deploy.sh cdk-<network>`（如 `deploy-cfx-dev.sh` → `cdk-cfx-dev`）
+- **必填环境变量**：`L2_CHAIN_ID`、`L1_CHAIN_ID`、`L1_RPC_URL`、`KURTOSIS_L1_PREALLOCATED_MNEMONIC`
+- 配置流程：`params.template.yml` + `envsubst` → 临时 params → `kurtosis run`
+- 部署后暴露：`update-nginx/update_nginx_ports.sh <enclave>`（RPC / Grafana / Bridge UI）
+- 文档索引：`doc/how-to-deploy-cdk.md`、`doc/FAQ.md`、`doc/batch-sequence-issue.md`、`doc/cdk-on-conflux-epsace-issue.md`
+
+### zkevm-prover
+
+- C++ 单二进制 **zkProver**；testvectors/归档体积极大（下载脚本约 75GB+）
+- 三概念：**Executor**（校验 batch，不出 proof）、**Aggregator Client**（连 cdk-node 生成证明）、**StateDB**（Merkle 状态）
+- 启用真实证明：`zkevm_use_real_prover_client: true`（与 `zkevm_use_mock_prover_client` 互斥，资源要求高）
+
+---
+
+## 4. 端到端数据流
+
+```
+用户 → cdk-erigon-rpc → zkevm-pool-manager → cdk-erigon-sequencer（出块/封 batch）
+     → cdk-node（zkevm_getWitness）→ [zkevm-prover 证明，若已部署] → cdk-node（sequence + verify）→ L1 合约
+```
+
+当前 `params.template.yml` 下 prover 容器通常未部署；证明/验证路径以 enclave 内实际服务为准。
+
+完整 sequence diagram 与端口矩阵：**`cdk-work/doc/architecture-cdk-rollup.md`**。
+
+---
+
+## 5. 开发约定
+
+| 类别 | 约定 |
+|------|------|
+| **Submodule** | 在子模块目录内开发、提交、推送；根仓库只记录 submodule SHA，避免在根目录散落业务代码 |
+| **配置** | 不提交含真实 mnemonic、私钥、生产 RPC 的 `params*.yml`；以 `params.template.yml` + 环境变量为准 |
+| **镜像版本** | `cdk_node_image`、`zkevm_prover_image`、`agglayer_contracts_image` 须与代码 fork / 合约版本一致 |
+| **改 cdk** | 改代码 → `cd cdk && make build-docker` → 更新 params 中 image tag → 重新部署 enclave |
+| **改合约** | 改 `agglayer-contracts` → 构建 contracts 镜像 → 更新 `agglayer_contracts_image` |
+| **调试 L2** | `cast rpc zkevm_batchNumber` / `zkevm_virtualBatchNumber` / `zkevm_verifiedBatchNumber` |
+| **日志** | `kurtosis service logs <enclave> <service>`；`cdk-work/scripts/save-cdk-node-logs.sh` |
+| **文档优先** | Conflux 适配、已知 issue 以 `cdk-work/doc/` 为准，改行为前先查对应文档 |
+| **范围** | 本工作区面向 devnet/联调，非生产部署 |
+
+修改 kurtosis / cdk / 合约相关行为时，优先阅读 `cdk-work/doc/architecture-cdk-rollup.md` 中的配置溯源表，避免破坏服务间连接假设。
+
+---
+
+## 6. 常用命令速查
+
+```sh
+# 初始化子模块
+git submodule update --init --recursive
+
+# 构建 cdk 本地镜像（改 cdk 后必做）
+cd cdk && make build-docker
+
+# 部署（需先设置 L2_CHAIN_ID、L1_CHAIN_ID、L1_RPC_URL、KURTOSIS_L1_PREALLOCATED_MNEMONIC）
+cd cdk-work/scripts && ./deploy-cfx-dev.sh
+# 或: ./deploy.sh cdk-cfx-dev
+
+# Kurtosis 运维
+kurtosis enclave inspect <enclave>
+kurtosis service logs <enclave> <service>
+kurtosis service shell <enclave> contracts-1   # 服务名后缀因 Kurtosis 版本可能为 contracts-001
+
+# 部署后 nginx（替换 enclave 名）
+cd cdk-work/update-nginx && ./update_nginx_ports.sh <enclave>
+
+# L2 批次状态（先设置 RPC）
+export ETH_RPC_URL="<l2_rpc_url>"
+cast rpc zkevm_batchNumber
+cast rpc zkevm_virtualBatchNumber
+cast rpc zkevm_verifiedBatchNumber
+```
+
+---
+
+## 7. 延伸阅读
+
+### 本仓库
+
+- `cdk-work/doc/architecture-cdk-rollup.md` — 完整架构图、端口矩阵、prover 详解
+- `cdk-work/doc/how-to-deploy-cdk.md` — Conflux eSpace 部署步骤
+- `cdk-work/readme.md` — Kurtosis 操作、FAQ、cast 示例
+
+### Polygon 官方
+
+- [CDK Erigon 组件说明](https://docs.polygon.technology/cdk/getting-started/cdk-erigon/#polygon-zkevm-components)
+- [zkEVM 智能合约架构](https://docs.polygon.technology/zkEVM/architecture/high-level/smart-contracts/)
+- [kurtosis-cdk 入门](https://github.com/0xPolygon/kurtosis-cdk)（上游文档；本仓库 fork 为 `Pana/kurtosis-cdk`）

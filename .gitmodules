@@ -1,0 +1,16 @@
+[submodule "cdk"]
+	path = cdk
+	url = https://github.com/Pana/cdk.git
+	branch = conflux0.5.4
+[submodule "agglayer-contracts"]
+	path = agglayer-contracts
+	url = https://github.com/agglayer/agglayer-contracts.git
+[submodule "cdk-work"]
+	path = cdk-work
+	url = https://github.com/wangdayong228/cdk-work.git
+[submodule "kurtosis-cdk"]
+	path = kurtosis-cdk
+	url = https://github.com/Pana/kurtosis-cdk.git
+[submodule "zkevm-prover"]
+	path = zkevm-prover
+	url = https://github.com/0xPolygon/zkevm-prover.git
