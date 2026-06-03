@@ -20,3 +20,6 @@
 [submodule "zkevm-ethtx-manager"]
 	path = zkevm-ethtx-manager
 	url = https://github.com/pana/zkevm-ethtx-manager
+[submodule "cdk-erigon"]
+	path = cdk-erigon
+	url = https://github.com/0xPolygon/cdk-erigon.git
