@@ -17,3 +17,6 @@
 [submodule "ydyl-scripts-lib"]
 	path = ydyl-scripts-lib
 	url = https://github.com/wangdayong228/ydyl-scripts-lib.git
+[submodule "zkevm-ethtx-manager"]
+	path = zkevm-ethtx-manager
+	url = https://github.com/pana/zkevm-ethtx-manager
